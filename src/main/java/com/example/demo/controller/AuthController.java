@@ -1,14 +1,17 @@
 package com.example.demo.controller;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.*;
-
-import java.util.List;
-
+import com.example.demo.entity.MfaDetails;
 import com.example.demo.entity.User;
 import com.example.demo.repository.UserRepository;
-
+import com.example.demo.service.MfaService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/auth")
@@ -21,69 +24,94 @@ public class AuthController {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
-    // ================= REGISTER =================
+    @Autowired
+    private MfaService mfaService;
+
+    // ✅ REGISTER
     @PostMapping("/register")
-    public User register(@RequestBody User user) {
-
+    public ResponseEntity<?> register(@RequestBody User user) {
         user.setRole("student");
-
-        // ensure email exists
-        if (user.getEmail() == null || user.getEmail().isEmpty()) {
-            user.setEmail(user.getUsername());
-        }
-
-        // 🔥 ENCRYPT PASSWORD
         user.setPassword(passwordEncoder.encode(user.getPassword()));
-
-        return repo.save(user);
+        return ResponseEntity.ok(repo.save(user));
     }
 
-    // ================= LOGIN =================
+    // ✅ LOGIN WITH MFA
     @PostMapping("/login")
-    public User login(@RequestBody User user) {
+    public ResponseEntity<?> login(@RequestBody Map<String, String> request) {
 
-        System.out.println("Login attempt: " + user.getUsername());
+        String username = request.get("username");
+        String password = request.get("password");
 
-        User existingUser = repo.findByUsername(user.getUsername());
+        User user = repo.findByUsername(username);
+        if (user == null) user = repo.findByEmail(username);
 
-        if (existingUser == null) {
-            System.out.println("User NOT FOUND");
-            return null;
+        if (user == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("User not found");
         }
 
-        // ✅ ADMIN LOGIN (PLAIN PASSWORD)
-        if ("admin".equals(existingUser.getRole())) {
-            if (existingUser.getPassword().equals(user.getPassword())) {
-                System.out.println("ADMIN LOGIN SUCCESS");
-                return existingUser;
-            } else {
-                System.out.println("ADMIN PASSWORD WRONG");
-                return null;
+        boolean valid = passwordEncoder.matches(password, user.getPassword())
+                || password.equals(user.getPassword());
+
+        if (!valid) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid password");
+        }
+
+        MfaDetails mfa = mfaService.findByUser(user);
+
+        Map<String, Object> res = new HashMap<>();
+
+        // 🔥 FIRST TIME → GENERATE QR
+        if (mfa == null) {
+            mfa = mfaService.createMfaDetails(user);
+
+            try {
+                String url = mfaService.buildOtpAuthUrl(user, mfa.getSecretKey());
+                String qr = mfaService.createQrCodeDataUrl(url);
+
+                res.put("status", "MFA_SETUP");
+                res.put("qr", qr);
+                res.put("userId", user.getId());
+
+                return ResponseEntity.ok(res);
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                return ResponseEntity.status(500).body("QR generation failed");
             }
         }
 
-        // ✅ STUDENT LOGIN (BCRYPT)
-        if (passwordEncoder.matches(user.getPassword(), existingUser.getPassword())) {
-            System.out.println("STUDENT LOGIN SUCCESS");
-            return existingUser;
+        // 🔥 NEXT LOGIN → ONLY OTP (NO QR)
+        res.put("status", "MFA_VERIFY");
+        res.put("userId", user.getId());
+        return ResponseEntity.ok(res);
+    }
+
+    // ✅ VERIFY OTP
+    @PostMapping("/verify-mfa")
+    public ResponseEntity<?> verify(@RequestBody Map<String, String> req) {
+
+        Long userId = Long.parseLong(req.get("userId"));
+        int code = Integer.parseInt(req.get("otp"));
+
+        User user = repo.findById(userId).orElse(null);
+        if (user == null) return ResponseEntity.badRequest().body("User not found");
+
+        MfaDetails mfa = mfaService.findByUser(user);
+        if (mfa == null) return ResponseEntity.badRequest().body("MFA not setup");
+
+        boolean ok = mfaService.verifyCode(mfa.getSecretKey(), code);
+
+        if (!ok) {
+            return ResponseEntity.status(401).body("Invalid OTP");
         }
 
-        System.out.println("PASSWORD MISMATCH");
-        return null;
-    }
+        // ✅ RETURN FULL LOGIN SUCCESS DATA
+        Map<String, Object> res = new HashMap<>();
+        res.put("status", "SUCCESS");
+        res.put("userId", user.getId());
+        res.put("username", user.getUsername());
+        res.put("role", user.getRole());
 
-    // ================= ALL USERS =================
-    @GetMapping("/users")
-    public List<User> getAllUsers() {
-        return repo.findAll();
-    }
-
-    // ================= STUDENTS =================
-    @GetMapping("/students")
-    public List<User> getStudents() {
-        return repo.findAll()
-                   .stream()
-                   .filter(u -> "student".equals(u.getRole()))
-                   .toList();
+        return ResponseEntity.ok(res);
     }
 }
